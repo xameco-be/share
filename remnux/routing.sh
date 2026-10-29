@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# router.sh - Turn an REMnux host into a simple NAT router
+# router.sh - Turn a REMnux server into a simple NAT router
 #
 # Usage:
 #   sudo ./router.sh status  [wan_iface]
@@ -88,6 +88,54 @@ disable_masquerade() {
     fi
 }
 
+# --- REMnux fake services (fakedns / inetsim) --------------------------------
+
+FAKE_SERVICES=(inetsim fakedns)
+
+fake_service_pids() {
+    # Match the process name or a script path (fakedns is often a Python script)
+    pgrep -f -- "(^|/)$1( |$|\.py)" 2>/dev/null || true
+}
+
+stop_fake_services() {
+    local svc pids
+    for svc in "${FAKE_SERVICES[@]}"; do
+        # Stop the systemd unit if there is one
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "Stopping systemd service $svc"
+            systemctl stop "$svc"
+        fi
+        # Kill any remaining (manually started) instances
+        pids="$(fake_service_pids "$svc")"
+        if [[ -n "$pids" ]]; then
+            info "Killing running $svc process(es): $(echo $pids)"
+            kill $pids 2>/dev/null || true
+            sleep 1
+            pids="$(fake_service_pids "$svc")"
+            [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+        fi
+    done
+
+    # Verify nothing is left before going further
+    for svc in "${FAKE_SERVICES[@]}"; do
+        [[ -z "$(fake_service_pids "$svc")" ]] \
+            || die "$svc is still running, refusing to enable routing."
+    done
+    info "fakedns / inetsim are not running"
+}
+
+show_fake_services() {
+    local svc pids
+    for svc in "${FAKE_SERVICES[@]}"; do
+        pids="$(fake_service_pids "$svc")"
+        if [[ -n "$pids" ]]; then
+            echo "$svc: RUNNING (PID $(echo $pids))"
+        else
+            echo "$svc: not running"
+        fi
+    done
+}
+
 # --- Status ------------------------------------------------------------------
 
 show_status() {
@@ -116,6 +164,10 @@ show_status() {
     echo
     echo "=== FORWARD chain policy ==="
     iptables -S FORWARD | head -n1
+
+    echo
+    echo "=== REMnux fake services ==="
+    show_fake_services
 }
 
 # --- Main --------------------------------------------------------------------
@@ -133,6 +185,7 @@ case "$ACTION" in
         ;;
     enable)
         require_iface "$IFACE"
+        stop_fake_services
         enable_forwarding
         enable_masquerade "$IFACE"
         echo
